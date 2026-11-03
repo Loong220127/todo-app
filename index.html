@@ -1851,8 +1851,8 @@
     check.dataset.action = 'toggle';
     check.setAttribute('role', 'checkbox');
     check.setAttribute('aria-checked', todo.completed ? 'true' : 'false');
-    check.setAttribute('aria-label', todo.completed ? '标记为未完成' : '标记为已完成');
-    check.title = todo.completed ? '标记为未完成' : '标记为已完成';
+    check.setAttribute('aria-label', todo.completed ? '标记为未完成' : '完成并删除此待办');
+    check.title = todo.completed ? '标记为未完成' : '完成后自动删除';
     check.innerHTML = ICONS.check;
 
     var main = document.createElement('div');
@@ -2001,8 +2001,9 @@
     }
     els.pendingList.hidden = pending.length === 0;
     els.pendingNote.textContent = pending.length
-      ? '按截止时间升序 · 无截止日期在后'
+      ? '完成后自动删除 · 按截止时间升序'
       : '';
+    els.pendingNote.title = '勾选完成后会删除该待办及其图片、附件和云端数据';
   }
 
   /* ---------------- Toasts ---------------- */
@@ -2593,6 +2594,63 @@
     clearFileError();
   }
 
+  function loadPendingFileDeletions() {
+    var raw = safeGetItem('blue-todo-deleted-files:v1');
+    if (!raw) return [];
+    try {
+      var ids = JSON.parse(raw);
+      return Array.isArray(ids) ? ids.filter(function (id) { return typeof id === 'string' && id; }) : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function savePendingFileDeletions(ids) {
+    try {
+      window.localStorage.setItem('blue-todo-deleted-files:v1', JSON.stringify(ids));
+    } catch (err) { /* ignore */ }
+  }
+
+  function queueFileDeletion(id) {
+    var ids = loadPendingFileDeletions();
+    if (ids.indexOf(id) === -1) {
+      ids.push(id);
+      savePendingFileDeletions(ids);
+    }
+  }
+
+  function removePendingFileDeletion(id) {
+    var ids = loadPendingFileDeletions();
+    var next = ids.filter(function (item) { return item !== id; });
+    if (next.length !== ids.length) savePendingFileDeletions(next);
+  }
+
+  function flushPendingFileDeletions() {
+    if (!syncState.config || !syncState.config.listId) return Promise.resolve(false);
+    var ids = loadPendingFileDeletions();
+    if (!ids.length) return Promise.resolve(true);
+
+    var index = 0;
+    function next() {
+      if (index >= ids.length) return Promise.resolve(true);
+      var fileId = ids[index++];
+      return syncRpc('delete_todo_file', {
+        p_id: syncState.config.listId,
+        p_key: syncState.config.key,
+        p_file_id: fileId
+      }).then(function () {
+        removePendingFileDeletion(fileId);
+        return next();
+      }).catch(function (err) {
+        if (err && /not_found|共享码无效/i.test(err.message || '')) {
+          removePendingFileDeletion(fileId);
+        }
+        return next();
+      });
+    }
+    return next();
+  }
+
   function cleanupRemovedFiles(ids) {
     ids.forEach(function (id) {
       fileDbDelete(id).catch(function () { /* ignore */ });
@@ -2601,7 +2659,13 @@
           p_id: syncState.config.listId,
           p_key: syncState.config.key,
           p_file_id: id
-        }).catch(function () { /* ignore */ });
+        }).then(function () {
+          removePendingFileDeletion(id);
+        }).catch(function (err) {
+          if (!err || !/not_found|共享码无效/i.test(err.message || '')) {
+            queueFileDeletion(id);
+          }
+        });
       }
     });
   }
@@ -2630,6 +2694,11 @@
         }, 60000);
       });
     }).then(function () {
+      // 上传期间待办已被删除（例如勾选完成自动删除）时，清理刚上传的文件
+      if (!state.todos.some(function (item) { return item.id === todoId; })) {
+        cleanupRemovedFiles([fileId]);
+        return false;
+      }
       var nextTodos = state.todos.map(function (item) {
         if (item.id !== todoId) return item;
         return Object.assign({}, item, {
@@ -3790,7 +3859,9 @@
     if (!syncState.config) return;
     els.syncNowBtn.disabled = true;
 
-    uploadLocalFiles().then(function () {
+    flushPendingFileDeletions().then(function () {
+      return uploadLocalFiles();
+    }).then(function () {
       if (syncState.dirty) {
         return pushToCloud(true).then(function (ok) {
           if (!ok) return false;
@@ -3874,22 +3945,32 @@
   function toggleTodo(id) {
     var target = state.todos.find(function (item) { return item.id === id; });
     if (!target) return;
-    var nowCompleted = !target.completed;
 
-    var nextTodos = state.todos.map(function (item) {
-      if (item.id !== id) return item;
-      return Object.assign({}, item, {
-        completed: nowCompleted,
-        completedAt: nowCompleted ? Date.now() : null
+    // 兼容旧数据：已完成的条目点击圆圈时恢复为未完成
+    if (target.completed) {
+      var restored = state.todos.map(function (item) {
+        if (item.id !== id) return item;
+        return Object.assign({}, item, { completed: false, completedAt: null });
       });
-    });
+      if (!persist(restored)) return;
+      render();
+      showToast({ title: '已恢复为未完成', type: 'info', duration: 2000 });
+      return;
+    }
 
+    var fileIds = (target.files || []).map(function (file) { return file.id; });
+    var nextTodos = state.todos.filter(function (item) { return item.id !== id; });
     if (!persist(nextTodos)) return;
+
+    if (fileIds.length) cleanupRemovedFiles(fileIds);
     render();
     showToast({
-      title: nowCompleted ? '已完成，干得漂亮' : '已恢复为未完成',
-      type: nowCompleted ? 'success' : 'info',
-      duration: 2000
+      title: '已完成并删除',
+      message: '「' + truncate(target.text, 40) + '」' +
+        (fileIds.length ? '及 ' + fileIds.length + ' 个附件' : '') +
+        '已从清单中删除，云端同步数据也会一并清理。',
+      type: 'success',
+      duration: 3600
     });
   }
 
@@ -4141,6 +4222,7 @@
       if (syncState.dirty) pushToCloud(false);
       else pullFromCloud({ silent: true });
       uploadLocalFiles();
+      flushPendingFileDeletions();
     }
   });
   window.addEventListener('offline', function () {
@@ -4226,6 +4308,7 @@
     updateSyncUI();
     if (syncState.config) {
       window.setTimeout(function () { pullFromCloud({ initial: true, silent: true }); }, 600);
+      window.setTimeout(function () { flushPendingFileDeletions(); }, 1200);
       window.setTimeout(function () { uploadLocalFiles(); }, 1800);
     }
     syncState.pollTimer = window.setInterval(function () {
