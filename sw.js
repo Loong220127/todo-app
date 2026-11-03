@@ -1,6 +1,6 @@
 ﻿'use strict';
 
-const CACHE_NAME = 'todo-app-v3';
+const CACHE_NAME = 'todo-app-v4';
 const APP_SHELL = [
   './',
   './index.html',
@@ -51,4 +51,5 @@ self.addEventListener('fetch', (event) => {
       })
   );
 });
+
 
